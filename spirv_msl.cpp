@@ -2799,6 +2799,7 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 	bool is_noperspective = has_decoration(var.self, DecorationNoPerspective);
 	bool is_centroid = has_decoration(var.self, DecorationCentroid);
 	bool is_sample = has_decoration(var.self, DecorationSample);
+	bool is_per_vertex = storage == StorageClassInput && has_decoration(var.self, DecorationPerVertexKHR);
 
 	// Add a reference to the variable type to the interface struct.
 	uint32_t ib_mbr_idx = uint32_t(ib_type.member_types.size());
@@ -2879,7 +2880,7 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 			});
 		}
 	}
-	else if (!meta.strip_array)
+	else if (!meta.strip_array && !is_per_vertex)
 		ir.meta[var.self].decoration.qualified_alias = qual_var_name;
 
 	if (var.storage == StorageClassOutput && var.initializer != ID(0))
@@ -2978,6 +2979,27 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationCentroid);
 		if (is_sample)
 			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationSample);
+	}
+
+	if (is_per_vertex)
+	{
+		// Load per-vertex values from the vertex_value<T> into a local array variable for indexing.
+		entry_func.add_local_variable(var.self);
+		vars_needing_early_declaration.push_back(var.self);
+
+		static const char *vertex_index_lut[] = {
+			"first",
+			"second",
+			"third",
+		};
+
+		uint32_t elem_cnt = to_array_size_literal(type);
+		entry_func.fixup_hooks_in.push_back([=, &var]() {
+			for (uint32_t i = 0; i < elem_cnt; i++)
+			{
+				statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, ".get(vertex_index::", vertex_index_lut[i], ");");
+			}
+		});
 	}
 
 	set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
@@ -3891,8 +3913,9 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 		ensure_struct_members_valid_vecsizes(get_variable_data_type(var), locn);
 	}
 
-	if (storage == StorageClassInput && has_decoration(var.self, DecorationPerVertexKHR))
-		SPIRV_CROSS_THROW("PerVertexKHR decoration is not supported in MSL.");
+	bool is_per_vertex = storage == StorageClassInput && has_decoration(var.self, DecorationPerVertexKHR);
+	if (is_per_vertex && !msl_options.supports_msl_version(4, 0))
+		SPIRV_CROSS_THROW("PerVertexKHR decoration is not supported before MSL 4.0.");
 
 	// If variable names alias, they will end up with wrong names in the interface struct, because
 	// there might be aliases in the member name cache and there would be a mismatch in fixup_in code.
@@ -4013,7 +4036,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 							var_chain_qual += join("[", elem_idx, "]");
 						}
 
-						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
+						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type && !is_per_vertex)
 						{
 							add_composite_member_variable_to_interface_block(storage, ib_var_ref, ib_type,
 							                                                 var, var_type, mbr_idx, meta,
@@ -4074,7 +4097,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 				is_builtin = false;
 
 			// MSL does not allow matrices or arrays in input or output variables, so need to handle it specially.
-			if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
+			if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type && !is_per_vertex)
 			{
 				add_composite_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
 			}
@@ -4271,8 +4294,8 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 		// Barycentric inputs must be emitted in stage-in, because they can have interpolation arguments.
 		if (is_active && (bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR))
 		{
-			if (has_seen_barycentric)
-				SPIRV_CROSS_THROW("Cannot declare both BaryCoordNV and BaryCoordNoPerspNV in same shader in MSL.");
+			if (has_seen_barycentric && !msl_options.supports_msl_version(4, 0))
+				SPIRV_CROSS_THROW("Cannot declare both BaryCoordNV and BaryCoordNoPerspNV in same shader before MSL 4.0.");
 			has_seen_barycentric = true;
 			hidden = false;
 		}
@@ -16692,13 +16715,13 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 		return "unknown_type";
 	}
 
+	auto *var = maybe_get_backing_variable(id);
+	if (var && var->basevariable)
+		var = &get<SPIRVariable>(var->basevariable);
+
 	// Matrix?
 	if (type.columns > 1)
 	{
-		auto *var = maybe_get_backing_variable(id);
-		if (var && var->basevariable)
-			var = &get<SPIRVariable>(var->basevariable);
-
 		// Need to special-case threadgroup matrices. Due to an oversight, Metal's
 		// matrix struct prior to Metal 3 lacks constructors in the threadgroup AS,
 		// preventing us from default-constructing or initializing matrices in threadgroup storage.
@@ -16716,6 +16739,12 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 	// Vector or Matrix?
 	if (type.vecsize > 1)
 		type_name += to_string(type.vecsize);
+
+	// Per-vertex values?
+	if (member && var && has_decoration(var->self, DecorationPerVertexKHR))
+	{
+		return join("vertex_value<", type_name, ">");
+	}
 
 	if (type.array.empty() || using_builtin_array())
 	{
